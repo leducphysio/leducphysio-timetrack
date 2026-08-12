@@ -1,0 +1,10 @@
+{
+  "name": "timeoff-tracker",
+  "version": "1.0.0",
+  "description": "Employee time-off tracking app for Leduc City Centre Physio",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
