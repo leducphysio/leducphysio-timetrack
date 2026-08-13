@@ -97,20 +97,9 @@ function notFound(res) {
 function forbidden(res) {
   sendHtml(res, '<h1>403 Forbidden</h1>', 403);
 }
-
-// ---------- helpers ----------
-function countBusinessDays(startStr, endStr) {
-  const start = new Date(startStr + 'T00:00:00');
-  const end = new Date(endStr + 'T00:00:00');
-  if (isNaN(start) || isNaN(end) || end < start) return 0;
-  let count = 0;
-  const cur = new Date(start);
-  while (cur <= end) {
-    const day = cur.getDay();
-    if (day !== 0 && day !== 6) count++;
-    cur.setDate(cur.getDate() + 1);
-  }
-  return count;
+function csvField(f) {
+  const s = String(f == null ? '' : f);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 function serveStatic(req, res, pathname) {
@@ -125,6 +114,24 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+// Punch-clock summary used by the dashboard: whether they're currently
+// clocked in, since when, and hours worked today (closed punches plus, if
+// currently clocked in, the running total).
+function computePunchStatus(user) {
+  const today = new Date().toISOString().slice(0, 10);
+  const open = db.getOpenPunch(user.id);
+  const closedHoursToday = db.sumClosedPunchHoursForDate(user.id, today);
+  if (open) {
+    const elapsed = (Date.now() - new Date(open.clock_in).getTime()) / (1000 * 60 * 60);
+    return {
+      isOpen: true,
+      sinceLabel: new Date(open.clock_in).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      hoursToday: closedHoursToday + elapsed
+    };
+  }
+  return { isOpen: false, sinceLabel: null, hoursToday: closedHoursToday };
+}
+
 // ---------- request handler ----------
 const server = http.createServer(async (req, res) => {
   try {
@@ -137,6 +144,11 @@ const server = http.createServer(async (req, res) => {
     const cookies = parseCookies(req);
     const session = getSession(cookies.sid);
     const user = session ? db.getUserById(session.userId) : null;
+    if (user) {
+      // Keep auto-computed balances current on every page load.
+      db.processOvertimeForUser(user.id);
+      db.processVacationAccrualForUser(user.id);
+    }
 
     let body = {};
     if (method === 'POST') {
@@ -181,30 +193,66 @@ const server = http.createServer(async (req, res) => {
 
     // ---- employee dashboard ----
     if (method === 'GET' && pathname === '/dashboard') {
+      const periodStart = db.payPeriodStart(url.searchParams.get('period'));
       const myRequests = db.requestsForUser(user.id);
       return sendHtml(
         res,
         T.dashboardPage({
           user,
           balances: user.balances,
+          overtime: user.overtime,
+          accruedVacationPay: user.accrued_vacation_pay,
           myRequests,
           types: TYPES,
+          requestTypes: db.REQUEST_TYPES,
+          punchStatus: computePunchStatus(user),
+          scheduleDays: db.scheduleForUserPeriod(user.id, periodStart),
+          periodStart,
+          periodEndLabel: db.payPeriodEnd(periodStart),
+          paydayLabel: db.paydayForPeriod(periodStart),
           error: url.searchParams.get('error'),
           success: url.searchParams.get('success')
         })
       );
     }
 
+    // ---- punch clock ----
+    if (method === 'POST' && pathname === '/punch/in') {
+      db.punchIn(user.id);
+      return redirect(res, '/dashboard');
+    }
+    if (method === 'POST' && pathname === '/punch/out') {
+      db.punchOut(user.id);
+      return redirect(res, '/dashboard');
+    }
+
     if (method === 'POST' && pathname === '/requests') {
       const { type, start_date, end_date, reason } = body;
-      if (!TYPES.includes(type) || !start_date || !end_date) {
+      if (!db.REQUEST_TYPES.includes(type) || !start_date || !end_date) {
         return redirect(res, '/dashboard?error=' + encodeURIComponent('Please fill out all fields.'));
       }
-      const days = countBusinessDays(start_date, end_date);
-      if (days <= 0) {
-        return redirect(res, '/dashboard?error=' + encodeURIComponent('Invalid date range.'));
+      if (end_date < start_date) {
+        return redirect(res, '/dashboard?error=' + encodeURIComponent('End date must be on or after the start date.'));
       }
-      db.createRequest({ user_id: user.id, type, start_date, end_date, days_count: days, reason });
+      const typed = parseFloat(body.hours);
+      const explicitHours = !isNaN(typed) && typed > 0 ? typed : null;
+      const computedHours = db.calcRequestHours(user.id, start_date, end_date, explicitHours);
+      if (computedHours <= 0) {
+        return redirect(res, '/dashboard?error=' + encodeURIComponent("Couldn't work out hours for those dates — try entering the hours directly."));
+      }
+      if (type === 'overtime') {
+        const available = user.overtime.banked_hours - user.overtime.used_hours;
+        if (computedHours > available) {
+          return redirect(res, '/dashboard?error=' + encodeURIComponent(`You only have ${available.toFixed(2)} banked overtime hours available.`));
+        }
+      } else {
+        const b = user.balances[type];
+        const available = b.total_hours - b.used_hours;
+        if (computedHours > available) {
+          return redirect(res, '/dashboard?error=' + encodeURIComponent(`You only have ${available.toFixed(2)} ${type} hours available.`));
+        }
+      }
+      db.createRequest({ user_id: user.id, type, start_date, end_date, hours_count: explicitHours, reason });
       return redirect(res, '/dashboard?success=' + encodeURIComponent('Request submitted for approval.'));
     }
 
@@ -240,18 +288,18 @@ const server = http.createServer(async (req, res) => {
 
     // ---- my schedule (employee + admin can both view their own) ----
     if (method === 'GET' && pathname === '/schedule') {
-      const weekStart = db.isoWeekStart(url.searchParams.get('week'));
-      const start = new Date(weekStart + 'T00:00:00');
-      const days = [];
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(start);
-        d.setDate(d.getDate() + i);
-        const dateStr = d.toISOString().slice(0, 10);
-        const shift = db.getEffectiveShift(user.id, dateStr);
-        const timeOff = db.isApprovedTimeOff(user.id, dateStr);
-        days.push({ date: dateStr, ...shift, timeOffConflict: timeOff && shift.working });
-      }
-      return sendHtml(res, T.mySchedulePage({ user, weekStart, days }));
+      const periodStart = db.payPeriodStart(url.searchParams.get('period'));
+      const days = db.scheduleForUserPeriod(user.id, periodStart);
+      return sendHtml(
+        res,
+        T.mySchedulePage({
+          user,
+          periodStart,
+          periodEndLabel: db.payPeriodEnd(periodStart),
+          paydayLabel: db.paydayForPeriod(periodStart),
+          days
+        })
+      );
     }
 
     // ---- weekly HR check-in ----
@@ -313,6 +361,8 @@ const server = http.createServer(async (req, res) => {
       if (!requireAdmin()) return forbidden(res);
 
       if (method === 'GET' && pathname === '/admin') {
+        db.processOvertimeForAllUsers();
+        db.processVacationAccrualForAllUsers();
         const pending = db.pendingRequests().map((r) => {
           const u = db.getUserById(r.user_id);
           return { ...r, employee_name: u ? u.name : 'Unknown' };
@@ -352,7 +402,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (method === 'POST' && pathname === '/admin/employees') {
-        const { name, email, password, role, vacation_days, sick_days, personal_days, hours_per_day } = body;
+        const {
+          name, email, password, role,
+          vacation_hours, wellness_hours, personal_hours,
+          hours_per_day, overtime_hours,
+          hourly_wage, vacation_percent, accrued_vacation_pay
+        } = body;
         if (!name || !email || !password) {
           return redirect(res, '/admin?error=' + encodeURIComponent('Name, email, and password are required.'));
         }
@@ -365,11 +420,15 @@ const server = http.createServer(async (req, res) => {
           password,
           role,
           hours_per_day: parseFloat(hours_per_day) || 8,
+          hourly_wage: parseFloat(hourly_wage) || 0,
+          vacation_percent: parseFloat(vacation_percent) || 0,
+          accrued_vacation_pay: parseFloat(accrued_vacation_pay) || 0,
           allotments: {
-            vacation: parseFloat(vacation_days) || 0,
-            sick: parseFloat(sick_days) || 0,
-            personal: parseFloat(personal_days) || 0
-          }
+            vacation: parseFloat(vacation_hours) || 0,
+            wellness: parseFloat(wellness_hours) || 0,
+            personal: parseFloat(personal_hours) || 0
+          },
+          overtime_hours: parseFloat(overtime_hours) || 0
         });
         return redirect(res, '/admin?success=' + encodeURIComponent('Employee added.'));
       }
@@ -382,6 +441,12 @@ const server = http.createServer(async (req, res) => {
           if (!isNaN(v)) totals[t] = v;
         }
         db.updateBalances(balMatch[1], totals);
+        if (body.overtime != null) db.updateOvertimeBanked(balMatch[1], parseFloat(body.overtime));
+        db.updateWageAndAccrual(balMatch[1], {
+          hourly_wage: parseFloat(body.hourly_wage),
+          vacation_percent: parseFloat(body.vacation_percent),
+          accrued_vacation_pay: parseFloat(body.accrued_vacation_pay)
+        });
         return redirect(res, '/admin?success=' + encodeURIComponent('Balances updated.'));
       }
 
@@ -396,17 +461,43 @@ const server = http.createServer(async (req, res) => {
 
       // ---- team schedule ----
       if (method === 'GET' && pathname === '/admin/schedule') {
-        const weekStart = db.isoWeekStart(url.searchParams.get('week'));
-        const rows = db.teamScheduleForWeek(weekStart);
-        return sendHtml(res, T.teamSchedulePage({ user, weekStart, rows, error: url.searchParams.get('error'), success: url.searchParams.get('success') }));
+        db.processOvertimeForAllUsers();
+        db.processVacationAccrualForAllUsers();
+        const periodStart = db.payPeriodStart(url.searchParams.get('period'));
+        const rows = db.teamScheduleForPeriod(periodStart);
+        return sendHtml(
+          res,
+          T.teamSchedulePage({
+            user,
+            periodStart,
+            periodEndLabel: db.payPeriodEnd(periodStart),
+            paydayLabel: db.paydayForPeriod(periodStart),
+            rows,
+            error: url.searchParams.get('error'),
+            success: url.searchParams.get('success')
+          })
+        );
       }
 
       const editScheduleMatch = pathname.match(/^\/admin\/schedule\/(\d+)$/);
       if (method === 'GET' && editScheduleMatch) {
         const emp = db.getUserById(editScheduleMatch[1]);
         if (!emp) return notFound(res);
+        const periodStart = db.payPeriodStart(url.searchParams.get('period'));
         const employee = { ...emp, overrides: db.overridesForUser(emp.id) };
-        return sendHtml(res, T.editSchedulePage({ user, employee, error: url.searchParams.get('error'), success: url.searchParams.get('success') }));
+        return sendHtml(
+          res,
+          T.editSchedulePage({
+            user,
+            employee,
+            periodStart,
+            periodEndLabel: db.payPeriodEnd(periodStart),
+            paydayLabel: db.paydayForPeriod(periodStart),
+            periodDays: db.scheduleForUserPeriod(emp.id, periodStart),
+            error: url.searchParams.get('error'),
+            success: url.searchParams.get('success')
+          })
+        );
       }
 
       const templateMatch = pathname.match(/^\/admin\/schedule\/(\d+)\/template$/);
@@ -418,6 +509,14 @@ const server = http.createServer(async (req, res) => {
         }
         db.updateScheduleTemplate(empId, template);
         return redirect(res, `/admin/schedule/${empId}?success=` + encodeURIComponent('Weekly hours saved.'));
+      }
+
+      const copyWeekMatch = pathname.match(/^\/admin\/schedule\/(\d+)\/copy-week$/);
+      if (method === 'POST' && copyWeekMatch) {
+        const empId = copyWeekMatch[1];
+        const periodStart = db.payPeriodStart(url.searchParams.get('period'));
+        db.copyWeekForward(empId, periodStart);
+        return redirect(res, `/admin/schedule/${empId}?period=${periodStart}&success=` + encodeURIComponent('Week 1 copied to Week 2.'));
       }
 
       const overrideAddMatch = pathname.match(/^\/admin\/schedule\/(\d+)\/override$/);
@@ -438,6 +537,64 @@ const server = http.createServer(async (req, res) => {
       if (method === 'POST' && overrideDelMatch) {
         db.deleteOverride(overrideDelMatch[2]);
         return redirect(res, `/admin/schedule/${overrideDelMatch[1]}?success=` + encodeURIComponent('Change removed.'));
+      }
+
+      // ---- statutory holidays ----
+      if (method === 'GET' && pathname === '/admin/stat-holidays') {
+        return sendHtml(
+          res,
+          T.statHolidaysPage({
+            user,
+            holidays: db.listStatHolidays(),
+            error: url.searchParams.get('error'),
+            success: url.searchParams.get('success')
+          })
+        );
+      }
+      if (method === 'POST' && pathname === '/admin/stat-holidays') {
+        const { date, name } = body;
+        if (!date || !name) {
+          return redirect(res, '/admin/stat-holidays?error=' + encodeURIComponent('Please enter a date and name.'));
+        }
+        db.addStatHoliday(date, name);
+        return redirect(res, '/admin/stat-holidays?success=' + encodeURIComponent('Holiday added.'));
+      }
+      const statDelMatch = pathname.match(/^\/admin\/stat-holidays\/(\d+)\/delete$/);
+      if (method === 'POST' && statDelMatch) {
+        db.deleteStatHoliday(statDelMatch[1]);
+        return redirect(res, '/admin/stat-holidays?success=' + encodeURIComponent('Holiday removed.'));
+      }
+      const statCsvMatch = pathname.match(/^\/admin\/stat-holidays\/(\d+)\/export\.csv$/);
+      if (method === 'GET' && statCsvMatch) {
+        const holiday = db.listStatHolidays().find((h) => h.id === Number(statCsvMatch[1]));
+        if (!holiday) return notFound(res);
+        const header = ['Employee Name', 'Employee Email', 'Eligible', 'Regular Workday', 'Hours Worked', 'Average Daily Wage', 'Basis', 'Pay Owed'];
+        const csvLines = [header.join(',')];
+        for (const u of db.allUsers()) {
+          const b = db.computeStatHolidayPay(u.id, holiday.date);
+          csvLines.push(
+            [
+              u.name, u.email, b.eligible ? 'Yes' : 'No',
+              b.eligible ? (b.regularWorkday ? 'Yes' : 'No') : '',
+              b.eligible ? b.workedHours.toFixed(2) : '',
+              b.eligible ? b.averageDailyWage.toFixed(2) : '',
+              b.breakdown, (b.pay || 0).toFixed(2)
+            ].map(csvField).join(',')
+          );
+        }
+        const csv = csvLines.join('\n');
+        res.writeHead(200, {
+          'Content-Type': 'text/csv',
+          'Content-Disposition': `attachment; filename="stat-holiday-${holiday.date}.csv"`
+        });
+        return res.end(csv);
+      }
+      const statDetailMatch = pathname.match(/^\/admin\/stat-holidays\/(\d+)$/);
+      if (method === 'GET' && statDetailMatch) {
+        const holiday = db.listStatHolidays().find((h) => h.id === Number(statDetailMatch[1]));
+        if (!holiday) return notFound(res);
+        const breakdown = db.allUsers().map((u) => ({ ...db.computeStatHolidayPay(u.id, holiday.date), name: u.name }));
+        return sendHtml(res, T.statHolidayDetailPage({ user, holiday, breakdown }));
       }
 
       // ---- weekly check-ins (admin view) ----
@@ -526,25 +683,19 @@ const server = http.createServer(async (req, res) => {
           return redirect(res, '/admin/export?error=' + encodeURIComponent('Please choose a start and end date.'));
         }
         const rows = db.approvedRequestsInRange(start_date, end_date).sort((a, b) => a.start_date.localeCompare(b.start_date));
-        const header = ['Employee Name', 'Employee Email', 'Time Off Type', 'Start Date', 'End Date', 'Days', 'Hours', 'Notes'];
+        const header = ['Employee Name', 'Employee Email', 'Time Off Type', 'Start Date', 'End Date', 'Hours', 'Notes'];
         const csvLines = [header.join(',')];
         for (const r of rows) {
           const u = db.getUserById(r.user_id);
-          const hoursPerDay = u ? u.hours_per_day || 8 : 8;
-          const hours = (r.days_count * hoursPerDay).toFixed(2);
           const fields = [
             u ? u.name : 'Unknown',
             u ? u.email : '',
             T.cap(r.type),
             r.start_date,
             r.end_date,
-            r.days_count,
-            hours,
-            (r.reason || '').replace(/"/g, '""')
-          ].map((f) => {
-            const s = String(f);
-            return /[",\n]/.test(s) ? `"${s}"` : s;
-          });
+            (r.hours_count || 0).toFixed(2),
+            r.reason || ''
+          ].map(csvField);
           csvLines.push(fields.join(','));
         }
         const csv = csvLines.join('\n');
