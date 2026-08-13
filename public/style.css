@@ -1,15 +1,16 @@
 :root {
-  --primary: #2f6f5e;
-  --primary-dark: #234f43;
-  --bg: #f6f7f5;
+  --primary: #2563eb;
+  --primary-dark: #1e3a8a;
+  --accent-bg: #dbeafe;
+  --bg: #f5f7fb;
   --card: #ffffff;
-  --border: #e2e5e1;
-  --text: #24302c;
-  --muted: #6b756f;
+  --border: #dfe4ee;
+  --text: #1b2436;
+  --muted: #64708a;
   --danger: #b3452f;
   --danger-bg: #fbeae5;
-  --success: #2f6f5e;
-  --success-bg: #e8f2ee;
+  --success: #1c7a4d;
+  --success-bg: #e3f5ec;
   --warn-bg: #fff6e6;
   --warn: #8a6416;
 }
@@ -59,7 +60,7 @@ p.subtitle { color: var(--muted); margin-top: 0; }
 .grid { display: grid; gap: 1rem; }
 .balances-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .balance-tile {
-  background: var(--success-bg);
+  background: var(--accent-bg);
   border-radius: 8px;
   padding: 0.9rem 1rem;
 }
@@ -134,7 +135,7 @@ th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: u
 .cal-cell .daynum { color: var(--muted); font-size: 0.72rem; }
 .cal-cell .event {
   margin-top: 2px;
-  background: var(--success-bg);
+  background: var(--accent-bg);
   color: var(--primary-dark);
   border-radius: 4px;
   padding: 1px 4px;
@@ -145,3 +146,17 @@ th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: u
 }
 .cal-header { text-align: center; font-size: 0.75rem; color: var(--muted); font-weight: 600; }
 .cal-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.9rem; }
+
+.punch-card { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+.punch-status { font-size: 0.95rem; }
+.punch-status .state { font-weight: 700; }
+.punch-status .state.in { color: var(--success); }
+.punch-status .state.out { color: var(--muted); }
+button.btn.large { padding: 0.85rem 1.6rem; font-size: 1.05rem; }
+button.btn.punch-out { background: var(--danger); }
+button.btn.punch-out:hover { background: #8f3623; }
+
+.week-block { margin-bottom: 1.1rem; }
+.week-block:last-child { margin-bottom: 0; }
+.week-block h3 { font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; margin: 0 0 0.5rem; }
+.pay-period-banner { background: var(--accent-bg); border-radius: 8px; padding: 0.6rem 0.9rem; font-size: 0.85rem; color: var(--primary-dark); margin-bottom: 1rem; }
