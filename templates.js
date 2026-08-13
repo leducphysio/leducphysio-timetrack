@@ -6,6 +6,13 @@ function esc(s) {
 function cap(s) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
+function money(n) {
+  const v = Math.round((n || 0) * 100) / 100;
+  return '$' + v.toFixed(2);
+}
+function fmtNum(n) {
+  return (Math.round((n || 0) * 100) / 100).toString();
+}
 
 const HEAD = (title) => `<!DOCTYPE html>
 <html lang="en">
@@ -20,20 +27,24 @@ const HEAD = (title) => `<!DOCTYPE html>
 function nav(user, active) {
   const link = (href, label) =>
     `<a href="${href}"${active === href ? ' style="text-decoration:underline"' : ''}>${label}</a>`;
-  const homeLink = user.role === 'admin' ? link('/admin', 'Requests &amp; Team') : link('/dashboard', 'My Time Off');
   const isAdmin = user.role === 'admin';
-  const scheduleLink = isAdmin ? link('/admin/schedule', 'Schedule') : link('/schedule', 'My Schedule');
+  const homeLink = isAdmin ? link('/admin', 'Requests &amp; Team') : link('/dashboard', 'My Dashboard');
+  const myDashLink = isAdmin ? link('/dashboard', 'My Dashboard') : '';
+  const scheduleLink = isAdmin ? link('/admin/schedule', 'Schedule') : '';
   const checkinLink = isAdmin ? link('/admin/checkins', 'Check-ins') : link('/checkin', 'Weekly Check-in');
   const reviewLink = isAdmin ? link('/admin/reviews', 'Reviews') : link('/review', 'Annual Review');
+  const statLink = isAdmin ? link('/admin/stat-holidays', 'Stat Holidays') : '';
   const exportLink = isAdmin ? link('/admin/export', 'Payroll Export') : '';
   const settingsLink = isAdmin ? link('/admin/settings', 'Settings') : '';
   return `<nav>
   <div><span class="brand">Leduc City Centre Physio</span></div>
   <div>
     ${homeLink}
+    ${myDashLink}
     ${scheduleLink}
     ${checkinLink}
     ${reviewLink}
+    ${statLink}
     ${link('/calendar', 'Team Calendar')}
     ${exportLink}
     ${settingsLink}
@@ -67,27 +78,98 @@ function loginPage({ error }) {
 </body></html>`;
 }
 
-function dashboardPage({ user, balances, myRequests, types, error, success }) {
-  const tiles = types
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function periodNavLinks(baseUrl, periodStart, periodEndLabel, paydayLabel) {
+  const start = new Date(periodStart + 'T00:00:00');
+  const prev = new Date(start); prev.setDate(prev.getDate() - 14);
+  const next = new Date(start); next.setDate(next.getDate() + 14);
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  return `<div class="cal-nav">
+    <a class="btn secondary small" href="${baseUrl}?period=${fmt(prev)}">&larr; Prev period</a>
+    <h2 style="margin:0">${esc(periodStart)} – ${esc(periodEndLabel)}</h2>
+    <a class="btn secondary small" href="${baseUrl}?period=${fmt(next)}">Next period &rarr;</a>
+  </div>
+  <p class="pay-period-banner">Payday for this pay period: ${esc(paydayLabel)}</p>`;
+}
+
+// Renders a 14-day (two-week) effective schedule as two week-blocks. `days`
+// is an array of {date, working, start_time, end_time, timeOffConflict}.
+function scheduleWeekBlocks(days) {
+  const week1 = days.slice(0, 7);
+  const week2 = days.slice(7, 14);
+  const block = (weekDays, label) => {
+    const rows = weekDays
+      .map((d) => {
+        const dayName = DAY_NAMES[new Date(d.date + 'T00:00:00').getDay()];
+        const hours = d.working ? `${esc(d.start_time)} – ${esc(d.end_time)}` : `<span class="muted">Off</span>`;
+        const conflict = d.timeOffConflict
+          ? `<span class="badge denied" style="margin-left:0.5rem">Approved time off this day</span>`
+          : '';
+        return `<tr><td>${dayName}</td><td>${esc(d.date)}</td><td>${hours}${conflict}</td></tr>`;
+      })
+      .join('');
+    return `<div class="week-block"><h3>${label}</h3><table><tbody>${rows}</tbody></table></div>`;
+  };
+  return block(week1, 'Week 1') + block(week2, 'Week 2');
+}
+
+function totalScheduledHours(days) {
+  let total = 0;
+  for (const d of days) {
+    if (!d.working) continue;
+    const [sh, sm] = (d.start_time || '0:0').split(':').map(Number);
+    const [eh, em] = (d.end_time || '0:0').split(':').map(Number);
+    const mins = eh * 60 + em - (sh * 60 + sm);
+    if (mins > 0) total += mins / 60;
+  }
+  return total;
+}
+
+function dashboardPage({
+  user, balances, overtime, accruedVacationPay, myRequests, types, requestTypes,
+  punchStatus, scheduleDays, periodStart, periodEndLabel, paydayLabel, error, success
+}) {
+  const nonVacationTiles = types
+    .filter((t) => t !== 'vacation')
     .map((t) => {
       const b = balances[t];
-      const remaining = (b.total_days - b.used_days).toFixed(2).replace(/\.00$/, '');
+      const remaining = fmtNum(b.total_hours - b.used_hours);
       return `<div class="balance-tile">
         <div class="type">${esc(t)}</div>
-        <div class="amount">${remaining} days</div>
-        <div class="sub">${b.used_days} used of ${b.total_days}</div>
+        <div class="amount">${remaining} hrs</div>
+        <div class="sub">${fmtNum(b.used_hours)} used of ${fmtNum(b.total_hours)}</div>
       </div>`;
     })
     .join('');
 
-  const typeOptions = types.map((t) => `<option value="${t}">${cap(t)}</option>`).join('');
+  const vb = balances.vacation;
+  const vacationAvailableTile = `<div class="balance-tile">
+    <div class="type">vacation (available)</div>
+    <div class="amount">${fmtNum(vb.total_hours - vb.used_hours)} hrs</div>
+    <div class="sub">${fmtNum(vb.used_hours)} used of ${fmtNum(vb.total_hours)}</div>
+  </div>`;
+  const vacationAccruedTile = `<div class="balance-tile">
+    <div class="type">vacation pay (accrued)</div>
+    <div class="amount">${money(accruedVacationPay)}</div>
+    <div class="sub">earned to date — separate from your available days above</div>
+  </div>`;
+
+  const otRemaining = fmtNum(overtime.banked_hours - overtime.used_hours);
+  const overtimeTile = `<div class="balance-tile">
+    <div class="type">overtime</div>
+    <div class="amount">${otRemaining} hrs</div>
+    <div class="sub">${overtime.used_hours} used of ${overtime.banked_hours} banked</div>
+  </div>`;
+
+  const typeOptions = requestTypes.map((t) => `<option value="${t}">${cap(t)}</option>`).join('');
 
   const rows = myRequests
     .map(
       (r) => `<tr>
       <td>${esc(r.type)}</td>
       <td>${esc(r.start_date)} – ${esc(r.end_date)}</td>
-      <td>${r.days_count}</td>
+      <td>${fmtNum(r.hours_count)} hrs</td>
       <td><span class="badge ${r.status}">${esc(r.status)}</span></td>
       <td>${esc(r.reason)}</td>
       <td>${
@@ -99,33 +181,63 @@ function dashboardPage({ user, balances, myRequests, types, error, success }) {
     )
     .join('');
 
-  return `${HEAD('My Time Off')}
+  const punchCard = punchStatus.isOpen
+    ? `<div class="punch-card">
+        <div class="punch-status">Punched <span class="state in">in</span> since ${esc(punchStatus.sinceLabel)} · ${fmtNum(punchStatus.hoursToday)} hrs so far today</div>
+        <form method="POST" action="/punch/out"><button type="submit" class="btn large punch-out">Punch out</button></form>
+      </div>`
+    : `<div class="punch-card">
+        <div class="punch-status">Currently <span class="state out">punched out</span>${punchStatus.hoursToday ? ` · ${fmtNum(punchStatus.hoursToday)} hrs today so far` : ''}</div>
+        <form method="POST" action="/punch/in"><button type="submit" class="btn large">Punch in</button></form>
+      </div>`;
+
+  return `${HEAD('My Dashboard')}
   ${nav(user, '/dashboard')}
   <div class="container">
     <h1>Hi ${esc(user.name)}</h1>
-    <p class="subtitle">Here's your time off balance and request history.</p>
+    <p class="subtitle">Your schedule, punch clock, and time off — all in one place.</p>
     ${alerts(error, success)}
+
     <div class="card">
-      <h2>Your balances</h2>
-      <div class="grid balances-grid">${tiles}</div>
+      <h2>Punch clock</h2>
+      ${punchCard}
     </div>
+
+    <div class="card">
+      <h2>Your shift schedule</h2>
+      ${periodNavLinks('/dashboard', periodStart, periodEndLabel, paydayLabel)}
+      ${scheduleWeekBlocks(scheduleDays)}
+      <p class="muted" style="margin-top:0.75rem">Scheduled this pay period: ${fmtNum(totalScheduledHours(scheduleDays))} hours.</p>
+    </div>
+
+    <div class="card">
+      <h2>Your time off balances</h2>
+      <div class="grid balances-grid">${vacationAvailableTile}${vacationAccruedTile}${nonVacationTiles}${overtimeTile}</div>
+      <p class="muted" style="margin-top:0.75rem">Overtime banks automatically: any week you're scheduled over 40 hours, the extra hours are added here.</p>
+    </div>
+
     <div class="card">
       <h2>Request time off</h2>
-      <form method="POST" action="/requests">
+      <form method="POST" action="/requests" id="requestForm">
         <div class="row">
           <div class="field"><label for="type">Type</label><select id="type" name="type" required>${typeOptions}</select></div>
           <div class="field"><label for="start_date">Start date</label><input type="date" id="start_date" name="start_date" required /></div>
           <div class="field"><label for="end_date">End date</label><input type="date" id="end_date" name="end_date" required /></div>
         </div>
+        <div class="field">
+          <label for="hours">Hours (optional)</label>
+          <input type="number" id="hours" name="hours" step="0.25" min="0.25" />
+          <p class="muted">Leave blank to automatically use your normal scheduled hours for these dates.</p>
+        </div>
         <div class="field"><label for="reason">Note (optional)</label><textarea id="reason" name="reason" rows="2"></textarea></div>
         <button type="submit" class="btn">Submit request</button>
-        <p class="muted">Weekends are automatically excluded from the day count.</p>
       </form>
     </div>
+
     <div class="card">
       <h2>Your requests</h2>
       <table>
-        <thead><tr><th>Type</th><th>Dates</th><th>Days</th><th>Status</th><th>Note</th><th></th></tr></thead>
+        <thead><tr><th>Type</th><th>Dates</th><th>Amount</th><th>Status</th><th>Note</th><th></th></tr></thead>
         <tbody>${rows || `<tr><td colspan="6" class="muted">No requests yet.</td></tr>`}</tbody>
       </table>
     </div>
@@ -140,7 +252,7 @@ function adminPage({ user, pending, employees, types, error, success }) {
       <td>${esc(r.employee_name)}</td>
       <td>${esc(r.type)}</td>
       <td>${esc(r.start_date)} – ${esc(r.end_date)}</td>
-      <td>${r.days_count}</td>
+      <td>${fmtNum(r.hours_count)} hrs</td>
       <td>${esc(r.reason)}</td>
       <td>
         <form method="POST" action="/admin/requests/${r.id}/approve" style="display:inline"><button type="submit" class="btn small">Approve</button></form>
@@ -153,13 +265,18 @@ function adminPage({ user, pending, employees, types, error, success }) {
   const empRows = employees
     .map((e) => {
       const b = e.balances;
+      const ot = e.overtime;
       return `<tr>
         <td>${esc(e.name)}</td>
         <td>${esc(e.email)}</td>
         <td>${esc(e.role)}</td>
-        <td><input type="number" name="vacation" form="balform-${e.id}" value="${b.vacation.total_days}" step="0.5" min="0" style="width:70px" /> <span class="muted">(${b.vacation.used_days} used)</span></td>
-        <td><input type="number" name="sick" form="balform-${e.id}" value="${b.sick.total_days}" step="0.5" min="0" style="width:70px" /> <span class="muted">(${b.sick.used_days} used)</span></td>
-        <td><input type="number" name="personal" form="balform-${e.id}" value="${b.personal.total_days}" step="0.5" min="0" style="width:70px" /> <span class="muted">(${b.personal.used_days} used)</span></td>
+        <td><input type="number" name="vacation" form="balform-${e.id}" value="${fmtNum(b.vacation.total_hours)}" step="0.25" min="0" style="width:65px" /> <span class="muted">(${fmtNum(b.vacation.used_hours)} used)</span></td>
+        <td><input type="number" name="wellness" form="balform-${e.id}" value="${fmtNum(b.wellness.total_hours)}" step="0.25" min="0" style="width:65px" /> <span class="muted">(${fmtNum(b.wellness.used_hours)} used)</span></td>
+        <td><input type="number" name="personal" form="balform-${e.id}" value="${fmtNum(b.personal.total_hours)}" step="0.25" min="0" style="width:65px" /> <span class="muted">(${fmtNum(b.personal.used_hours)} used)</span></td>
+        <td><input type="number" name="overtime" form="balform-${e.id}" value="${ot.banked_hours}" step="0.25" min="0" style="width:65px" /> <span class="muted">(${ot.used_hours} used)</span></td>
+        <td><input type="number" name="hourly_wage" form="balform-${e.id}" value="${e.hourly_wage}" step="0.25" min="0" style="width:65px" /></td>
+        <td><input type="number" name="vacation_percent" form="balform-${e.id}" value="${e.vacation_percent}" step="0.5" min="0" max="100" style="width:60px" /></td>
+        <td><input type="number" name="accrued_vacation_pay" form="balform-${e.id}" value="${e.accrued_vacation_pay}" step="0.01" min="0" style="width:75px" /></td>
         <td>
           <form id="balform-${e.id}" method="POST" action="/admin/employees/${e.id}/balances" style="display:inline"></form>
           <button type="submit" form="balform-${e.id}" class="btn small secondary">Save</button>
@@ -182,7 +299,7 @@ function adminPage({ user, pending, employees, types, error, success }) {
     <div class="card">
       <h2>Pending requests</h2>
       <table>
-        <thead><tr><th>Employee</th><th>Type</th><th>Dates</th><th>Days</th><th>Note</th><th>Decision</th></tr></thead>
+        <thead><tr><th>Employee</th><th>Type</th><th>Dates</th><th>Amount</th><th>Note</th><th>Decision</th></tr></thead>
         <tbody>${pendingRows || `<tr><td colspan="6" class="muted">No pending requests.</td></tr>`}</tbody>
       </table>
     </div>
@@ -197,12 +314,16 @@ function adminPage({ user, pending, employees, types, error, success }) {
         <div class="row">
           <div class="field"><label for="role">Role</label><select id="role" name="role"><option value="employee">Employee</option><option value="admin">Admin</option></select></div>
           <div class="field"><label for="hours_per_day">Hours per work day</label><input type="number" id="hours_per_day" name="hours_per_day" value="8" step="0.5" min="1" max="24" /></div>
+          <div class="field"><label for="hourly_wage">Hourly wage ($)</label><input type="number" id="hourly_wage" name="hourly_wage" value="0" step="0.25" min="0" /></div>
+          <div class="field"><label for="vacation_percent">Vacation accrual %</label><input type="number" id="vacation_percent" name="vacation_percent" value="0" step="0.5" min="0" max="100" /></div>
         </div>
-        <p class="muted">Starting balances (in days) — matches how Jane Payroll's time off policies track vacation/sick time:</p>
+        <p class="muted">Starting balances (in hours) — Jane Payroll tracks vacation/wellness time in hours too:</p>
         <div class="row">
-          <div class="field"><label for="vacation_days">Vacation days</label><input type="number" id="vacation_days" name="vacation_days" value="0" step="0.5" min="0" /></div>
-          <div class="field"><label for="sick_days">Sick days</label><input type="number" id="sick_days" name="sick_days" value="0" step="0.5" min="0" /></div>
-          <div class="field"><label for="personal_days">Personal days</label><input type="number" id="personal_days" name="personal_days" value="0" step="0.5" min="0" /></div>
+          <div class="field"><label for="vacation_hours">Vacation hours (available)</label><input type="number" id="vacation_hours" name="vacation_hours" value="0" step="0.25" min="0" /></div>
+          <div class="field"><label for="wellness_hours">Wellness hours</label><input type="number" id="wellness_hours" name="wellness_hours" value="0" step="0.25" min="0" /></div>
+          <div class="field"><label for="personal_hours">Personal hours</label><input type="number" id="personal_hours" name="personal_hours" value="0" step="0.25" min="0" /></div>
+          <div class="field"><label for="overtime_hours">Starting banked overtime (hours)</label><input type="number" id="overtime_hours" name="overtime_hours" value="0" step="0.25" min="0" /></div>
+          <div class="field"><label for="accrued_vacation_pay">Starting accrued vacation pay ($)</label><input type="number" id="accrued_vacation_pay" name="accrued_vacation_pay" value="0" step="0.01" min="0" /></div>
         </div>
         <button type="submit" class="btn">Add employee</button>
       </form>
@@ -210,9 +331,10 @@ function adminPage({ user, pending, employees, types, error, success }) {
     <div class="card">
       <h2>Employees</h2>
       <table>
-        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Vacation</th><th>Sick</th><th>Personal</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Vacation (hrs)</th><th>Wellness (hrs)</th><th>Personal (hrs)</th><th>Overtime (hrs)</th><th>Wage ($/hr)</th><th>Vac %</th><th>Accrued vac pay</th><th></th></tr></thead>
         <tbody>${empRows}</tbody>
       </table>
+      <p class="muted" style="margin-top:0.75rem">Overtime and accrued vacation pay both update automatically in the background (overtime weekly, vacation pay every pay period) — you can still adjust any of these manually if needed.</p>
     </div>
   </div>
 </body></html>`;
@@ -302,12 +424,12 @@ function exportPage({ user, error }) {
     <div class="card">
       <p class="muted">
         Jane Payroll doesn't currently offer a live sync for time off, so approved
-        vacation, sick, and personal time still needs to be keyed into Jane's own
+        vacation, wellness, and personal time still needs to be keyed into Jane's own
         Time Off policies (Billing &gt; Payroll &gt; Account &gt; Time Off) or
         timesheets when you run payroll. This export lists everything approved
-        in a date range — in both <strong>days</strong> and <strong>hours</strong>
-        (Jane tracks vacation time in hours) — so you can copy it in quickly
-        instead of hunting back through requests.
+        in a date range, in <strong>hours</strong> (Jane tracks vacation time in
+        hours) — so you can copy it in quickly instead of hunting back through
+        requests.
       </p>
       <form method="GET" action="/admin/export.csv">
         <div class="row">
@@ -316,85 +438,62 @@ function exportPage({ user, error }) {
         </div>
         <button type="submit" class="btn">Download CSV</button>
       </form>
+      <p class="muted" style="margin-top:0.75rem">Looking for statutory holiday pay? That's calculated separately under <a href="/admin/stat-holidays">Stat Holidays</a>.</p>
     </div>
   </div>
 </body></html>`;
 }
 
-const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-
-function weekNavLinks(baseUrl, weekStart) {
-  const start = new Date(weekStart + 'T00:00:00');
-  const prev = new Date(start); prev.setDate(prev.getDate() - 7);
-  const next = new Date(start); next.setDate(next.getDate() + 7);
-  const fmt = (d) => d.toISOString().slice(0, 10);
-  const end = new Date(start); end.setDate(end.getDate() + 6);
-  const label = `${start.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })} – ${end.toLocaleDateString('en-CA', { month: 'short', day: 'numeric', year: 'numeric' })}`;
-  return `<div class="cal-nav">
-    <a class="btn secondary small" href="${baseUrl}?week=${fmt(prev)}">&larr; Prev week</a>
-    <h2 style="margin:0">${label}</h2>
-    <a class="btn secondary small" href="${baseUrl}?week=${fmt(next)}">Next week &rarr;</a>
-  </div>`;
-}
-
-// ---------- employee: my schedule ----------
-function mySchedulePage({ user, weekStart, days }) {
-  const rows = days
-    .map((d) => {
-      const dayName = DAY_NAMES[new Date(d.date + 'T00:00:00').getDay()];
-      const hours = d.working ? `${esc(d.start_time)} – ${esc(d.end_time)}` : `<span class="muted">Off</span>`;
-      const conflict = d.timeOffConflict
-        ? `<span class="badge denied" style="margin-left:0.5rem">Approved time off this day</span>`
-        : '';
-      return `<tr><td>${dayName}</td><td>${esc(d.date)}</td><td>${hours}${conflict}</td></tr>`;
-    })
-    .join('');
+// ---------- employee/admin: shift schedule for the current pay period ----------
+function mySchedulePage({ user, periodStart, periodEndLabel, paydayLabel, days }) {
   return `${HEAD('My Schedule')}
   ${nav(user, '/schedule')}
   <div class="container">
     <h1>My Schedule</h1>
-    <p class="subtitle">Your working hours for the week.</p>
+    <p class="subtitle">Your working hours for this pay period.</p>
     <div class="card">
-      ${weekNavLinks('/schedule', weekStart)}
-      <table>
-        <thead><tr><th>Day</th><th>Date</th><th>Hours</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
+      ${periodNavLinks('/schedule', periodStart, periodEndLabel, paydayLabel)}
+      ${scheduleWeekBlocks(days)}
     </div>
   </div>
 </body></html>`;
 }
 
-// ---------- admin: team schedule for a week ----------
-function teamSchedulePage({ user, weekStart, rows, error, success }) {
-  const dayHeaders = rows.length
-    ? rows[0].days.map((d) => `<th>${DAY_NAMES[new Date(d.date + 'T00:00:00').getDay()].slice(0, 3)}<br><span class="muted">${esc(d.date.slice(5))}</span></th>`).join('')
-    : '';
-  const bodyRows = rows
-    .map((r) => {
-      const cells = r.days
-        .map((d) => {
-          if (!d.working) return `<td class="muted">Off</td>`;
-          const conflictClass = d.timeOffConflict ? 'style="background:var(--danger-bg)"' : '';
-          const conflictNote = d.timeOffConflict ? `<br><span class="badge denied">time off</span>` : '';
-          return `<td ${conflictClass}>${esc(d.start_time)}-${esc(d.end_time)}${conflictNote}</td>`;
-        })
-        .join('');
-      return `<tr><td><a href="/admin/schedule/${r.userId}">${esc(r.name)}</a></td>${cells}</tr>`;
-    })
-    .join('');
+// ---------- admin: team schedule for a pay period ----------
+function teamSchedulePage({ user, periodStart, periodEndLabel, paydayLabel, rows, error, success }) {
+  const dayHeader = (d) => `<th>${DAY_NAMES[new Date(d.date + 'T00:00:00').getDay()].slice(0, 3)}<br><span class="muted">${esc(d.date.slice(5))}</span></th>`;
+  const week1Headers = rows.length ? rows[0].days.slice(0, 7).map(dayHeader).join('') : '';
+  const week2Headers = rows.length ? rows[0].days.slice(7, 14).map(dayHeader).join('') : '';
+
+  const cellsFor = (dayList) =>
+    dayList
+      .map((d) => {
+        if (!d.working) return `<td class="muted">Off</td>`;
+        const conflictClass = d.timeOffConflict ? 'style="background:var(--danger-bg)"' : '';
+        const conflictNote = d.timeOffConflict ? `<br><span class="badge denied">time off</span>` : '';
+        return `<td ${conflictClass}>${esc(d.start_time)}-${esc(d.end_time)}${conflictNote}</td>`;
+      })
+      .join('');
+
+  const week1Rows = rows.map((r) => `<tr><td><a href="/admin/schedule/${r.userId}">${esc(r.name)}</a></td>${cellsFor(r.days.slice(0, 7))}</tr>`).join('');
+  const week2Rows = rows.map((r) => `<tr><td><a href="/admin/schedule/${r.userId}">${esc(r.name)}</a></td>${cellsFor(r.days.slice(7, 14))}</tr>`).join('');
+
   return `${HEAD('Team Schedule')}
   ${nav(user, '/admin/schedule')}
   <div class="container">
     <h1>Team Schedule</h1>
-    <p class="subtitle">Click an employee's name to edit their weekly hours or add a one-off change.</p>
+    <p class="subtitle">Click an employee's name to edit their weekly hours, copy a week, or add a one-off change.</p>
     ${alerts(error, success)}
     <div class="card">
-      ${weekNavLinks('/admin/schedule', weekStart)}
-      <table>
-        <thead><tr><th>Employee</th>${dayHeaders}</tr></thead>
-        <tbody>${bodyRows || `<tr><td colspan="8" class="muted">No employees yet.</td></tr>`}</tbody>
-      </table>
+      ${periodNavLinks('/admin/schedule', periodStart, periodEndLabel, paydayLabel)}
+      <div class="week-block">
+        <h3>Week 1</h3>
+        <table><thead><tr><th>Employee</th>${week1Headers}</tr></thead><tbody>${week1Rows || `<tr><td colspan="8" class="muted">No employees yet.</td></tr>`}</tbody></table>
+      </div>
+      <div class="week-block">
+        <h3>Week 2</h3>
+        <table><thead><tr><th>Employee</th>${week2Headers}</tr></thead><tbody>${week2Rows || `<tr><td colspan="8" class="muted">No employees yet.</td></tr>`}</tbody></table>
+      </div>
       <p class="muted" style="margin-top:0.75rem">Cells highlighted in red are scheduled to work but have approved time off that day — worth double-checking.</p>
     </div>
   </div>
@@ -402,7 +501,7 @@ function teamSchedulePage({ user, weekStart, rows, error, success }) {
 }
 
 // ---------- admin: edit one employee's schedule ----------
-function editSchedulePage({ user, employee, error, success }) {
+function editSchedulePage({ user, employee, periodStart, periodEndLabel, paydayLabel, periodDays, error, success }) {
   const dayRows = DAY_NAMES
     .map((name, i) => {
       const entry = employee.schedule_template[String(i)];
@@ -431,8 +530,17 @@ function editSchedulePage({ user, employee, error, success }) {
     <p class="subtitle"><a href="/admin/schedule">&larr; Back to team schedule</a></p>
     ${alerts(error, success)}
     <div class="card">
-      <h2>Weekly hours</h2>
-      <p class="muted">Leave both times blank for a day off. This repeats every week.</p>
+      <h2>This pay period</h2>
+      ${periodNavLinks(`/admin/schedule/${employee.id}`, periodStart, periodEndLabel, paydayLabel)}
+      ${scheduleWeekBlocks(periodDays)}
+      <form method="POST" action="/admin/schedule/${employee.id}/copy-week?period=${periodStart}" style="margin-top:0.75rem">
+        <button type="submit" class="btn secondary">Copy Week 1 to Week 2</button>
+        <p class="muted">Takes this period's Week 1 hours and applies them to Week 2 as one-off changes, without touching the recurring weekly pattern below.</p>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Weekly hours (recurring pattern)</h2>
+      <p class="muted">Leave both times blank for a day off. This repeats every week unless overridden by a one-off change or a copied week below.</p>
       <form method="POST" action="/admin/schedule/${employee.id}/template">
         ${dayRows}
         <button type="submit" class="btn">Save weekly hours</button>
@@ -454,6 +562,79 @@ function editSchedulePage({ user, employee, error, success }) {
         <thead><tr><th>Date</th><th>Hours</th><th></th></tr></thead>
         <tbody>${overrideRows || `<tr><td colspan="3" class="muted">No one-off changes.</td></tr>`}</tbody>
       </table>
+    </div>
+  </div>
+</body></html>`;
+}
+
+// ---------- admin: statutory holidays ----------
+function statHolidaysPage({ user, holidays, error, success }) {
+  const rows = holidays
+    .map(
+      (h) => `<tr>
+      <td>${esc(h.date)}</td>
+      <td>${esc(h.name)}</td>
+      <td><a class="btn small secondary" href="/admin/stat-holidays/${h.id}">View pay breakdown</a></td>
+      <td><form method="POST" action="/admin/stat-holidays/${h.id}/delete"><button type="submit" class="btn small danger">Remove</button></form></td>
+    </tr>`
+    )
+    .join('');
+  return `${HEAD('Stat Holidays')}
+  ${nav(user, '/admin/stat-holidays')}
+  <div class="container">
+    <h1>Statutory Holidays</h1>
+    <p class="subtitle">Alberta's 2026 general holidays are pre-loaded. Who's off vs. working each one is controlled from each employee's Schedule page (one-off changes) — this page just calculates what's owed.</p>
+    ${alerts(error, success)}
+    <div class="card">
+      <h2>Add a holiday</h2>
+      <form method="POST" action="/admin/stat-holidays">
+        <div class="row" style="align-items:flex-end">
+          <div class="field"><label for="date">Date</label><input type="date" id="date" name="date" required /></div>
+          <div class="field"><label for="name">Name</label><input type="text" id="name" name="name" placeholder="e.g. Easter Monday" required /></div>
+        </div>
+        <button type="submit" class="btn secondary">Add</button>
+      </form>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Date</th><th>Name</th><th></th><th></th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="4" class="muted">No holidays yet.</td></tr>`}</tbody>
+      </table>
+    </div>
+  </div>
+</body></html>`;
+}
+
+function statHolidayDetailPage({ user, holiday, breakdown }) {
+  const rows = breakdown
+    .map((b) => {
+      if (!b.eligible) {
+        return `<tr><td>${esc(b.name)}</td><td colspan="4" class="muted">${esc(b.breakdown)}</td><td>${money(0)}</td></tr>`;
+      }
+      return `<tr>
+        <td>${esc(b.name)}</td>
+        <td>${b.regularWorkday ? 'Yes' : 'No'}</td>
+        <td>${fmtNum(b.workedHours)} hrs</td>
+        <td>${money(b.averageDailyWage)}</td>
+        <td>${esc(b.breakdown)}</td>
+        <td><strong>${money(b.pay)}</strong></td>
+      </tr>`;
+    })
+    .join('');
+  const total = breakdown.reduce((sum, b) => sum + (b.pay || 0), 0);
+  return `${HEAD(holiday.name + ' — Stat Pay')}
+  ${nav(user, '/admin/stat-holidays')}
+  <div class="container">
+    <h1>${esc(holiday.name)} — ${esc(holiday.date)}</h1>
+    <p class="subtitle"><a href="/admin/stat-holidays">&larr; Back to Stat Holidays</a></p>
+    <div class="card">
+      <p class="muted">Calculated per Alberta employment standards: average daily wage = total wages over the 4 weeks before the holiday ÷ days worked in that window. Eligibility requires 30+ workdays in the past 12 months.</p>
+      <table>
+        <thead><tr><th>Employee</th><th>Regular workday?</th><th>Hours worked</th><th>Avg daily wage</th><th>Basis</th><th>Pay owed</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="6" class="muted">No employees yet.</td></tr>`}</tbody>
+      </table>
+      <p style="margin-top:0.75rem"><strong>Total: ${money(total)}</strong></p>
+      <a class="btn secondary" style="margin-top:0.5rem" href="/admin/stat-holidays/${holiday.id}/export.csv">Download CSV</a>
     </div>
   </div>
 </body></html>`;
@@ -656,6 +837,7 @@ function settingsPage({ user, weeklyQuestions, annualQuestions, managerQuestions
 module.exports = {
   esc,
   cap,
+  money,
   loginPage,
   dashboardPage,
   adminPage,
@@ -665,6 +847,8 @@ module.exports = {
   mySchedulePage,
   teamSchedulePage,
   editSchedulePage,
+  statHolidaysPage,
+  statHolidayDetailPage,
   checkinPage,
   adminCheckinsPage,
   reviewPage,
